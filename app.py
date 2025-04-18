@@ -1,9 +1,9 @@
-import streamlit as st
+import streamlit as st 
+import os
 import mlflow
 import mlflow.sklearn
 import numpy as np
 import pandas as pd
-import os
 import shap
 import matplotlib.pyplot as plt
 import tempfile
@@ -11,21 +11,49 @@ from pathlib import Path
 import pdfplumber
 import whisper
 from paddleocr import PaddleOCR
+import openai
+from sklearn.base import is_classifier
 
 # --- Page Config ---
 st.set_page_config(page_title="Acumen ML Predictor", layout="wide")
-st.sidebar.title("📎 Multimodal Upload")
+st.title("🧠 Acumen: Multimodal ML Dashboard")
+st.markdown("Upload a file or enter features to get model predictions.")
 
-# --- Multimodal Upload Sidebar ---
+# --- Sidebar Upload ---
+st.sidebar.title("📌 Multimodal Upload")
 uploaded_file = st.sidebar.file_uploader(
-    "Drop a PDF, MP3, or PNG file here",
-    type=["pdf", "mp3", "png"],
+    "Drop a PDF, MP3, PNG, or CSV file",
+    type=["pdf", "mp3", "png", "csv"],
     accept_multiple_files=False
 )
 
+# --- Define Features (Assuming 4 features for the model) ---
+feature_names = ["feature_0", "feature_1", "feature_2", "feature_3"]
+inputs = []
+
+# --- Load Model from MLflow Registry ---
+@st.cache_resource
+def load_model():
+    mlflow.set_tracking_uri("http://localhost:5000")
+    return mlflow.sklearn.load_model("models:/AcumenModel/Production")
+
+model = load_model()
+is_classification = is_classifier(model)
+
+# --- Summarization Utilities ---
+def summarize_text_openai(text, model="gpt-3.5-turbo", max_tokens=1000):
+    prompt = f"Summarize the following:\n\n{text[:3000]}"
+    response = openai.ChatCompletion.create(
+        model=model,
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=max_tokens,
+        temperature=0.5,
+    )
+    return response.choices[0].message.content.strip()
+
+# --- PDF / MP3 / PNG / CSV Handling ---
 if uploaded_file is not None:
     file_suffix = Path(uploaded_file.name).suffix.lower()
-
     with tempfile.NamedTemporaryFile(delete=False, suffix=file_suffix) as tmp_file:
         tmp_file.write(uploaded_file.read())
         tmp_path = tmp_file.name
@@ -34,108 +62,72 @@ if uploaded_file is not None:
         st.sidebar.success("📄 PDF uploaded successfully!")
         with pdfplumber.open(tmp_path) as pdf:
             all_text = "\n".join(page.extract_text() or "" for page in pdf.pages)
-        st.markdown("### 📄 Extracted PDF Text")
-        st.text_area("Text from PDF:", all_text, height=300)
+        st.subheader("📄 Extracted Text from PDF")
+        st.text_area("PDF Content:", all_text, height=250)
+        summary = summarize_text_openai(all_text)
+        st.subheader("🖍️ Summary")
+        st.text_area("Summary:", summary, height=200)
 
     elif file_suffix == ".mp3":
-        st.sidebar.success("🎧 MP3 uploaded — transcribing...")
-        model = whisper.load_model("base")
-        result = model.transcribe(tmp_path)
-        st.markdown("### 🎧 Transcribed Audio")
-        st.text_area("Transcription:", result["text"], height=300)
+        st.sidebar.success("🎷 MP3 uploaded — transcribing...")
+        model_audio = whisper.load_model("base")
+        result = model_audio.transcribe(tmp_path)
+        st.subheader("🎷 Transcribed Audio")
+        st.text_area("Transcription:", result["text"], height=250)
+        summary = summarize_text_openai(result["text"])
+        st.subheader("🖍️ Summary")
+        st.text_area("Summary:", summary, height=200)
 
     elif file_suffix == ".png":
-        st.sidebar.success("🖼 PNG uploaded — running OCR...")
+        st.sidebar.success("🖼️ PNG uploaded — extracting text...")
         ocr = PaddleOCR(use_angle_cls=True, lang='en')
         result = ocr.ocr(tmp_path, cls=True)
+        extracted_text = "\n".join([line[1][0] for line in result[0]])
+        st.subheader("🖼️ Extracted Text from Image")
+        st.text_area("OCR Output:", extracted_text, height=250)
+        summary = summarize_text_openai(extracted_text)
+        st.subheader("🖍️ Summary")
+        st.text_area("Summary:", summary, height=200)
 
-        ocr_text = ""
-        for line in result[0]:
-            ocr_text += f"{line[1][0]}\n"
+    elif file_suffix == ".csv":
+        st.sidebar.success("📊 CSV uploaded — predicting batch...")
+        df = pd.read_csv(tmp_path)
+        predictions = model.predict(df)
+        st.subheader("📊 Batch Predictions")
+        df["prediction"] = predictions
+        st.dataframe(df)
+        st.download_button("📅 Download Results", df.to_csv(index=False), "predictions.csv", "text/csv")
 
-        st.markdown("### 🖼 OCR Text from Image")
-        st.text_area("OCR Result:", ocr_text, height=300)
+# --- Manual Feature Input ---
+st.subheader("🛠️ Enter Features Manually")
+cols = st.columns(len(feature_names))
+for i, feature in enumerate(feature_names):
+    val = cols[i].slider(f"{feature}", 0.0, 10.0, 5.0, step=0.1)
+    inputs.append(val)
 
-    else:
-        st.sidebar.warning("⚠️ Unsupported file type.")
+input_df = pd.DataFrame([inputs], columns=feature_names)
 
-# --- Load Model ---
-st.title("🧠 Acumen: Model Inference Dashboard")
-feature_names = ["feature_0", "feature_1", "feature_2", "feature_3"]
-
-@st.cache_resource
-def load_model():
-    mlflow.set_tracking_uri("http://localhost:5000")
-    return mlflow.sklearn.load_model("models:/AcumenModel/Production")
-
-model = load_model()
-
-# --- Single Prediction ---
-st.markdown("### 🎛️ Enter Features for Prediction")
-inputs = [st.slider(f, 0.0, 10.0, 5.0, 0.1) for f in feature_names]
-input_array = np.array(inputs).reshape(1, -1)
-input_df = pd.DataFrame(input_array, columns=feature_names)
-
+# --- Predict Button ---
 if st.button("🚀 Predict"):
     prediction = model.predict(input_df)
-    probabilities = model.predict_proba(input_df)
-
-    st.success(f"✅ Predicted Class: **{prediction[0]}**")
+    st.success(f"✅ Prediction: **{prediction[0]}**")
     st.dataframe(input_df.style.highlight_max(axis=1))
 
-    st.markdown("### 🔢 Class Probabilities")
-    prob_df = pd.DataFrame(probabilities, columns=[f"Class {i}" for i in range(probabilities.shape[1])])
-    st.bar_chart(prob_df.T)
+    if is_classification:
+        proba = model.predict_proba(input_df)
+        st.markdown("### 🔮 Prediction Probabilities")
+        prob_df = pd.DataFrame(proba, columns=[f"Class {i}" for i in range(proba.shape[1])])
+        st.bar_chart(prob_df.T)
 
-    st.markdown("### 🧠 SHAP Feature Importance")
-    explainer = shap.TreeExplainer(model)
-    shap_values = explainer.shap_values(input_df)
-    fig, ax = plt.subplots()
+    # --- SHAP Explainability ---
+    st.markdown("### 🔍 SHAP Feature Importance")
+    explainer = shap.Explainer(model)
+    shap_values = explainer(input_df)
 
-    if isinstance(shap_values, list) and len(shap_values) > 1:
-        predicted_class = int(prediction[0])
-        st.markdown(f"🔎 SHAP for class: {predicted_class}")
-        shap.summary_plot(shap_values[predicted_class], input_df, plot_type="bar", show=False)
-    else:
-        st.markdown("🔎 SHAP (binary classifier)")
-        shap.summary_plot(shap_values, input_df, plot_type="bar", show=False)
-
-    st.pyplot(fig)
-
-# --- Batch CSV Prediction ---
-st.markdown("## 📎 Batch Prediction from CSV")
-uploaded_csv = st.file_uploader("Upload CSV file with the same feature columns", type=["csv"])
-
-if uploaded_csv is not None:
     try:
-        batch_df = pd.read_csv(uploaded_csv)
-        st.write("📄 Uploaded Data Preview:")
-        st.dataframe(batch_df.head())
-
-        missing_cols = [col for col in feature_names if col not in batch_df.columns]
-        if missing_cols:
-            st.error(f"❌ Missing columns in uploaded file: {missing_cols}")
-        else:
-            if st.button("📊 Predict for Batch"):
-                batch_predictions = model.predict(batch_df)
-                batch_probabilities = model.predict_proba(batch_df)
-
-                result_df = batch_df.copy()
-                result_df["Predicted Class"] = batch_predictions
-
-                for i in range(batch_probabilities.shape[1]):
-                    result_df[f"Class_{i}_Prob"] = batch_probabilities[:, i]
-
-                st.success("✅ Batch prediction completed!")
-                st.dataframe(result_df.head())
-
-                csv = result_df.to_csv(index=False).encode('utf-8')
-                st.download_button(
-                    label="⬇️ Download Predictions as CSV",
-                    data=csv,
-                    file_name='acumen_predictions.csv',
-                    mime='text/csv',
-                )
+        shap.initjs()
+        fig, ax = plt.subplots()
+        shap.plots.bar(shap_values, show=False)
+        st.pyplot(fig)
     except Exception as e:
-        st.error(f"❌ Failed to process file: {e}")
-
+        st.warning(f"⚠️ SHAP couldn't generate plot: {e}")
